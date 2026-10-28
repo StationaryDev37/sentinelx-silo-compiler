@@ -1,0 +1,98 @@
+name: Sentinel-X pinned Silo authorization probes
+
+on:
+  push:
+    paths:
+      - '.github/workflows/silo-auth-probes.yml'
+      - 'tests/SentinelXClaimingAuth_c5bbda1045e1.t.sol'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sentinelx-auth-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  local-authorization:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SILO_SHA: ed18f3a33be1a08e786279c50b914b1d6eaf04c7
+      FOUNDRY_PROFILE: vaults_tests
+      FOUNDRY_COMPILATION_JOBS: '2'
+    steps:
+      - name: Checkout only public test harness
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install Silo-recommended Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.4.4
+          cache: false
+
+      - name: Fetch exact pinned Silo commit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir silo
+          cd silo
+          git init -q
+          git remote add origin https://github.com/silo-finance/silo-contracts-v3.git
+          git -c fetch.parallel=1 fetch --depth=1 --filter=blob:none origin "$SILO_SHA"
+          git -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SILO_SHA"
+          echo "SOURCE_PIN=PASS $SILO_SHA"
+
+      - name: Initialize bounded build dependencies on Linux only
+        working-directory: silo
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git -c submodule.fetchJobs=2 submodule update --init --depth 1 --jobs 2 -- \
+            gitmodules/forge-std \
+            gitmodules/openzeppelin-contracts-5 \
+            gitmodules/openzeppelin-contracts-upgradeable-5 \
+            gitmodules/morpho-blue
+          test -f gitmodules/forge-std/src/Test.sol
+          test -f gitmodules/openzeppelin-contracts-5/contracts/proxy/Clones.sol
+          echo 'TEST_DEPENDENCIES=PASS'
+
+      - name: Install isolated Sentinel-X local authorization tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cp tests/SentinelXClaimingAuth_c5bbda1045e1.t.sol silo/silo-vaults/test/foundry/SentinelXClaimingAuth.t.sol
+          cmp tests/SentinelXClaimingAuth_c5bbda1045e1.t.sol silo/silo-vaults/test/foundry/SentinelXClaimingAuth.t.sol
+          sha256sum tests/SentinelXClaimingAuth_c5bbda1045e1.t.sol
+          echo 'TEST_SOURCE_MATCH=PASS'
+
+      - name: Execute negative and positive authorization controls
+        working-directory: silo
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/auth-results"
+          printf 'SILO_COMMIT=%s\n' "$SILO_SHA" > "$GITHUB_WORKSPACE/auth-results/context.txt"
+          sha256sum silo-vaults/test/foundry/SentinelXClaimingAuth.t.sol >> "$GITHUB_WORKSPACE/auth-results/context.txt"
+          forge --version | tee -a "$GITHUB_WORKSPACE/auth-results/context.txt"
+          forge test \
+            --match-path 'silo-vaults/test/foundry/SentinelXClaimingAuth.t.sol' \
+            -j 2 -vv \
+            2>&1 | tee "$GITHUB_WORKSPACE/auth-results/forge-auth.log"
+          grep -F '8 tests passed' "$GITHUB_WORKSPACE/auth-results/forge-auth.log" >/dev/null || {
+            echo 'BLOCKED: expected eight executed passing controls, see forge-auth.log' >&2
+            exit 2
+          }
+          echo 'SENTINELX_LOCAL_AUTH_CONTROLS=PASS'
+          echo 'EXPLOIT_PROOF=NOT_ESTABLISHED'
+
+      - name: Preserve execution record (including on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: silo-claiming-authorization-results
+          path: auth-results/
+          if-no-files-found: warn
+          retention-days: 3
