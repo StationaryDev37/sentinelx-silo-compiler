@@ -1,0 +1,155 @@
+name: Sentinel-X pinned Silo AST build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: silo-ast-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compile-vaults:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SILO_SHA: ed18f3a33be1a08e786279c50b914b1d6eaf04c7
+      FOUNDRY_PROFILE: vaults
+      FOUNDRY_COMPILATION_JOBS: '2'
+    steps:
+      - name: Install project-recommended Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.4.4
+          cache: false
+
+      - name: Fetch exact Silo revision (read-only)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir silo
+          cd silo
+          git init -q
+          git remote add origin https://github.com/silo-finance/silo-contracts-v3.git
+          git -c fetch.parallel=1 fetch --depth=1 --filter=blob:none origin "$SILO_SHA"
+          git -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SILO_SHA"
+          git status --porcelain
+          echo "SOURCE_PIN=PASS $SILO_SHA"
+
+      - name: Initialize bounded Solidity dependencies on cloud runner
+        working-directory: silo
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git -c submodule.fetchJobs=2 submodule update --init --depth 1 --jobs 2 -- \
+            gitmodules/forge-std \
+            gitmodules/openzeppelin-contracts-5 \
+            gitmodules/openzeppelin-contracts-upgradeable-5 \
+            gitmodules/morpho-blue
+          test -f gitmodules/openzeppelin-contracts-5/contracts/token/ERC20/ERC20.sol
+          test -f gitmodules/morpho-blue/src/Morpho.sol
+          echo 'PRIMARY_SUBMODULES=PASS'
+
+      - name: Compile actual Solidity 0.8.28 project and emit build-info
+        working-directory: silo
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          forge --version
+          mkdir -p "$GITHUB_WORKSPACE/compiler-output/build-info"
+          forge build --build-info --ast --use-literal-content \
+            --build-info-path "$GITHUB_WORKSPACE/compiler-output/build-info" \
+            -j 2 2>&1 | tee "$GITHUB_WORKSPACE/compiler-output/forge.log"
+
+      - name: Verify compiler source bytes and create phone-sized AST bundle
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, os, sys
+          root = Path('silo').resolve()
+          out = Path('compiler-output').resolve()
+          build_files = sorted((out/'build-info').glob('*.json'))
+          expected = {
+              'silo-vaults/contracts/SiloVault.sol',
+              'silo-vaults/contracts/PublicAllocator.sol',
+          }
+          if not build_files:
+              sys.exit('BLOCKED: Forge produced no build-info JSON')
+          selected = None
+          original_hash = None
+          for file in build_files:
+              raw = file.read_bytes()
+              doc = json.loads(raw)
+              inputs = doc.get('input', {}).get('sources', {})
+              outputs = doc.get('output', {}).get('sources', {})
+              mapping = {}
+              for rel in expected:
+                  matches = [key for key in inputs if key == rel or key.endswith('/'+rel)]
+                  if len(matches) != 1:
+                      break
+                  key = matches[0]
+                  src = inputs[key].get('content')
+                  ast = outputs.get(key, {}).get('ast')
+                  if not isinstance(src, str) or not isinstance(ast, dict):
+                      break
+                  # The actual pinned repository must contain identical bytes.
+                  if src.encode() != (root/rel).read_bytes():
+                      sys.exit('BLOCKED: compiler input differs from pinned Git source')
+                  if ast.get('nodeType') != 'SourceUnit':
+                      sys.exit('BLOCKED: SourceUnit AST missing')
+                  mapping[rel] = key
+              if len(mapping) == len(expected):
+                  if selected is not None:
+                      sys.exit('BLOCKED: ambiguous compiler build-info for targets')
+                  selected = (doc, mapping)
+                  original_hash = hashlib.sha256(raw).hexdigest()
+          if selected is None:
+              sys.exit('BLOCKED: no single build-info containing both candidate ASTs')
+          doc, mapping = selected
+          # Preserve exact target source unit ASTs and byte-identical compiler input.
+          compact = {
+              'input': {'language': 'Solidity', 'sources': {
+                  key: doc['input']['sources'][key] for key in mapping.values()
+              }},
+              'output': {'sources': {
+                  key: doc['output']['sources'][key] for key in mapping.values()
+              }, 'errors': [e for e in doc['output'].get('errors', [])
+                            if e.get('severity') == 'error']}
+          }
+          if compact['output']['errors']:
+              sys.exit('BLOCKED: compiler errors reported')
+          dest = out/'silo-vaults-ast.json'
+          dest.write_text(json.dumps(compact, separators=(',', ':')), encoding='utf-8')
+          if dest.stat().st_size > 96*1024*1024:
+              sys.exit('BLOCKED: compact AST exceeds v0.3 input limit')
+          manifest = {
+              'schema': 'sentinelx.compiler-provenance.v1',
+              'source_repo': 'silo-finance/silo-contracts-v3',
+              'source_commit': os.environ['SILO_SHA'],
+              'target_paths': sorted(expected),
+              'original_build_info_sha256': original_hash,
+              'compact_build_info_sha256': hashlib.sha256(dest.read_bytes()).hexdigest(),
+              'compact_build_info_bytes': dest.stat().st_size,
+              'warning': 'Compact artifact is derived from real compiler output, not independent exploit proof',
+          }
+          (out/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
+          print('PINNED_COMPILER_AST=PASS')
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Upload compiler evidence only (no Sentinel-X private source)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: silo-vaults-ast-pinned
+          path: |
+            compiler-output/silo-vaults-ast.json
+            compiler-output/manifest.json
+            compiler-output/forge.log
+          if-no-files-found: error
+          retention-days: 3
