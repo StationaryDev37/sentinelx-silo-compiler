@@ -1,0 +1,91 @@
+name: Sentinel-X pinned Silo accounting sequence probes
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sentinelx-accounting-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  accounting-sequences:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      SILO_SHA: ed18f3a33be1a08e786279c50b914b1d6eaf04c7
+      FOUNDRY_PROFILE: vaults_tests
+      FOUNDRY_COMPILATION_JOBS: '2'
+    steps:
+      - name: Checkout only public test harness
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install pinned Silo-recommended Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.4.4
+          cache: false
+
+      - name: Fetch exact public Silo source commit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir silo
+          cd silo
+          git init -q
+          git remote add origin https://github.com/silo-finance/silo-contracts-v3.git
+          git -c fetch.parallel=1 fetch --depth=1 --filter=blob:none origin "$SILO_SHA"
+          git -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SILO_SHA"
+          echo "SOURCE_PIN=PASS $SILO_SHA"
+
+      - name: Initialize dependencies on runner, never on Android
+        working-directory: silo
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git -c submodule.fetchJobs=2 submodule update --init --depth 1 --jobs 2 -- \
+            gitmodules/forge-std \
+            gitmodules/openzeppelin-contracts-5 \
+            gitmodules/openzeppelin-contracts-upgradeable-5 \
+            gitmodules/morpho-blue
+          test -f gitmodules/forge-std/src/Test.sol
+          echo DEPENDENCIES=PASS
+
+      - name: Install isolated accounting probes with byte check
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cp "tests/SentinelXSiloAccounting_ee566153c8f0.t.sol" silo/silo-vaults/test/foundry/SentinelXSiloAccounting.t.sol
+          cmp "tests/SentinelXSiloAccounting_ee566153c8f0.t.sol" silo/silo-vaults/test/foundry/SentinelXSiloAccounting.t.sol
+          echo TEST_SOURCE_MATCH=PASS
+
+      - name: Execute multi-user asset accounting hypotheses
+        working-directory: silo
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/accounting-results"
+          printf 'SILO_COMMIT=%s\n' "$SILO_SHA" > "$GITHUB_WORKSPACE/accounting-results/context.txt"
+          sha256sum silo-vaults/test/foundry/SentinelXSiloAccounting.t.sol >> "$GITHUB_WORKSPACE/accounting-results/context.txt"
+          forge --version | tee -a "$GITHUB_WORKSPACE/accounting-results/context.txt"
+          forge test --ffi --match-path 'silo-vaults/test/foundry/SentinelXSiloAccounting.t.sol' \
+            --fuzz-runs 24 -j 2 -vv \
+            2>&1 | tee "$GITHUB_WORKSPACE/accounting-results/forge-accounting.log"
+          grep -F '[PASS] testFuzz_AttackerEntersLastCannotExtractVictimAssets(' "$GITHUB_WORKSPACE/accounting-results/forge-accounting.log" >/dev/null
+          grep -F '[PASS] testFuzz_AttackerEntersFirstCannotExtractVictimAssets(' "$GITHUB_WORKSPACE/accounting-results/forge-accounting.log" >/dev/null
+          grep -F '[PASS] testFuzz_PartialWithdrawThenRedeemCannotIncreasePayout(' "$GITHUB_WORKSPACE/accounting-results/forge-accounting.log" >/dev/null
+          grep -F '3 passed; 0 failed; 0 skipped' "$GITHUB_WORKSPACE/accounting-results/forge-accounting.log" >/dev/null
+          echo ACCOUNTING_SEQUENCE_CONTROLS=PASS
+          echo EXPLOIT_PROOF=NOT_ESTABLISHED
+
+      - name: Preserve diagnostics on success or failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: silo-accounting-sequence-results
+          path: accounting-results/
+          if-no-files-found: warn
+          retention-days: 3
