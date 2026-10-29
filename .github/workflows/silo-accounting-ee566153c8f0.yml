@@ -55,8 +55,22 @@ jobs:
             gitmodules/forge-std \
             gitmodules/openzeppelin-contracts-5 \
             gitmodules/openzeppelin-contracts-upgradeable-5 \
-            gitmodules/morpho-blue
+            gitmodules/morpho-blue \
+            gitmodules/silo-foundry-utils
           test -f gitmodules/forge-std/src/Test.sol
+          test -f gitmodules/silo-foundry-utils/Cargo.toml
+          test -f common/addresses/anvil.json
+          test "$(git -C gitmodules/silo-foundry-utils rev-parse HEAD)" = "9f5ebeb9401884dda94599505b47b2e1700134a3"
+          command -v cargo >/dev/null || { echo 'BLOCKED: cargo missing on CI runner'; exit 2; }
+          (cd gitmodules/silo-foundry-utils && cargo build --release --locked)
+          install -m 755 gitmodules/silo-foundry-utils/target/release/silo-foundry-utils ./silo-foundry-utils
+          test -x ./silo-foundry-utils
+          dao="$(./silo-foundry-utils key-val-json-read --file common/addresses/anvil.json --key2 DAO)"
+          case "$dao" in
+            *0x6d228Fa4daD2163056A48Fc2186d716f5c65E89A*) ;;
+            *) echo 'BLOCKED: pinned FFI CLI fixture preflight failed'; exit 2 ;;
+          esac
+          echo SILO_FOUNDRY_UTILS_PREFLIGHT=PASS
           echo DEPENDENCIES=PASS
 
       - name: Install isolated accounting probes with byte check
