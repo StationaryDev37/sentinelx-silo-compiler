@@ -70,15 +70,15 @@ contract SentinelXSiloAccountingTest is IntegrationTest {
         vm.prank(BORROWER);
         vault.deposit(attackerIn, BORROWER);
 
-        uint256 partial = attackerIn / 3;
+        uint256 partialAssets = attackerIn / 3;
         vm.prank(BORROWER);
-        vault.withdraw(partial, BORROWER, BORROWER);
+        vault.withdraw(partialAssets, BORROWER, BORROWER);
 
         uint256 sharesRemaining = vault.balanceOf(BORROWER);
         vm.prank(BORROWER);
         uint256 finalOut = vault.redeem(sharesRemaining, BORROWER, BORROWER);
 
-        assertLe(partial + finalOut, attackerIn, "ATTACK: split exit created assets");
+        assertLe(partialAssets + finalOut, attackerIn, "ATTACK: split exit created assets");
         assertEq(vault.balanceOf(ONBEHALF), victimShares, "VICTIM_SHARES_MUTATED");
         assertEq(vault.balanceOf(BORROWER), 0, "ATTACKER_SHARES_NOT_BURNED");
     }
