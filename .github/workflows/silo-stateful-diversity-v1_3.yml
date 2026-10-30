@@ -1,0 +1,104 @@
+name: Sentinel-X isolated Silo sequence diversity v1.3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/silo-stateful-diversity-v1_3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sentinelx-diversity-v1-3-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  diversity-research:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      SILO_SHA: ed18f3a33be1a08e786279c50b914b1d6eaf04c7
+      FOUNDRY_PROFILE: core_test
+      FOUNDRY_COMPILATION_JOBS: '2'
+      RPC_MAINNET: http://127.0.0.1:8545
+      RPC_ARBITRUM: http://127.0.0.1:8545
+      RPC_ANVIL: http://127.0.0.1:8545
+      # Public local Anvil fixture key; do not fund or substitute a live key.
+      PRIVATE_KEY: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
+    steps:
+      - name: Checkout reviewable test harness
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.4.4
+          cache: false
+      - name: Fetch exact Silo upstream revision
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir silo && cd silo
+          git init -q
+          git remote add origin https://github.com/silo-finance/silo-contracts-v3.git
+          git -c fetch.parallel=1 fetch --depth=1 --filter=blob:none origin "$SILO_SHA"
+          git -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SILO_SHA"
+          echo "SOURCE_PIN=PASS $SILO_SHA"
+      - name: Build pinned Silo FFI fixture
+        working-directory: silo
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git -c submodule.fetchJobs=2 submodule update --init --depth 1 --jobs 2 -- \
+            gitmodules/forge-std \
+            gitmodules/openzeppelin-contracts-5 \
+            gitmodules/openzeppelin-contracts-upgradeable-5 \
+            gitmodules/morpho-blue \
+            gitmodules/silo-foundry-utils
+          test -f gitmodules/forge-std/src/Test.sol
+          test -f common/addresses/anvil.json
+          test "$(git -C gitmodules/silo-foundry-utils rev-parse HEAD)" = 9f5ebeb9401884dda94599505b47b2e1700134a3
+          (cd gitmodules/silo-foundry-utils && cargo build --release --locked)
+          install -m 755 gitmodules/silo-foundry-utils/target/release/silo-foundry-utils ./silo-foundry-utils
+          test -x ./silo-foundry-utils
+          dao="$(./silo-foundry-utils key-val-json-read --file common/addresses/anvil.json --key2 DAO)"
+          case "$dao" in
+            *0x6d228Fa4daD2163056A48Fc2186d716f5c65E89A*) ;;
+            *) echo 'BLOCKED: pinned FFI fixture mismatch'; exit 2 ;;
+          esac
+          echo SILO_FOUNDRY_UTILS_PREFLIGHT=PASS
+      - name: Install isolated test without source mutation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cp tests/SentinelXSiloStatefulDiversity.t.sol silo/silo-core/test/foundry/SentinelXSiloStatefulDiversity.t.sol
+          cmp tests/SentinelXSiloStatefulDiversity.t.sol silo/silo-core/test/foundry/SentinelXSiloStatefulDiversity.t.sol
+          echo TEST_SOURCE_MATCH=PASS
+      - name: Execute diverse local sequences
+        shell: bash
+        working-directory: silo
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/diversity-results"
+          printf 'SILO_COMMIT=%s\nGITHUB_COMMIT=%s\n' "$SILO_SHA" "$GITHUB_SHA" > "$GITHUB_WORKSPACE/diversity-results/context.txt"
+          sha256sum silo-core/test/foundry/SentinelXSiloStatefulDiversity.t.sol >> "$GITHUB_WORKSPACE/diversity-results/context.txt"
+          forge --version | tee -a "$GITHUB_WORKSPACE/diversity-results/context.txt"
+          forge test --ffi --match-path 'silo-core/test/foundry/SentinelXSiloStatefulDiversity.t.sol' \
+            --fuzz-runs 160 -j 2 -vv 2>&1 | tee "$GITHUB_WORKSPACE/diversity-results/forge-diversity.log"
+          grep -E '\[PASS\] testFuzz_DiverseActionOrdersMaintainDebtAndVictimIsolation\(uint96\) \(runs: 160,' \
+            "$GITHUB_WORKSPACE/diversity-results/forge-diversity.log" >/dev/null
+          grep -E '\[PASS\] testFuzz_DeniedCrossIdentityCallsAreAtomic\(uint96\) \(runs: 160,' \
+            "$GITHUB_WORKSPACE/diversity-results/forge-diversity.log" >/dev/null
+          grep -F '2 passed; 0 failed; 0 skipped' "$GITHUB_WORKSPACE/diversity-results/forge-diversity.log" >/dev/null
+          echo DIVERSITY_CONTROLS=PASS
+          echo EXPLOIT_PROOF=NOT_ESTABLISHED
+      - name: Preserve logs on pass or failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: silo-stateful-diversity-v1-3-evidence
+          path: diversity-results/
+          if-no-files-found: warn
+          retention-days: 7
