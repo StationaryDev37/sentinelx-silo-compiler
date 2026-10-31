@@ -1,0 +1,51 @@
+name: Sentinel-X Revert v4lend atomicity tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-foundry-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL || 'https://eth.drpc.org' }}
+      FOUNDRY_FFI: 'false'
+    steps:
+      - name: Checkout Sentinel-X evidence source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Foundry v1.5.0
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.0
+      - name: Fetch and pin Revert v4lend contest snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git clone --quiet --filter=blob:none --no-checkout https://github.com/revert-finance/v4lend.git target
+          git -C target fetch --quiet --depth=1 origin f6d0fb41b7487f60ce64e011312a956e184e2a75
+          git -C target checkout --quiet --detach FETCH_HEAD
+          test "$(git -C target rev-parse HEAD)" = f6d0fb41b7487f60ce64e011312a956e184e2a75
+          test "$(git -C target hash-object test/vault/V4VaultHook.t.sol)" = b62fabe756a076573a46a8b7209053c4f965c10b
+          git -C target submodule update --init --recursive --quiet
+          cp sx-cases/SentinelXRemintAtomicity.t.sol target/test/vault/SentinelXRemintAtomicity.t.sol
+          echo "SOURCE_PIN=PASS" | tee evidence/pin.txt
+          sha256sum sx-cases/SentinelXRemintAtomicity.t.sol | tee evidence/test.sha256
+          forge --version | tee evidence/forge-version.txt
+      - name: Run three real fork-backed atomicity tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cd target
+          forge test --match-contract SentinelXRemintAtomicity --match-test '^testSX_' -vvv 2>&1 | tee "$GITHUB_WORKSPACE/evidence/forge-test.log"
+      - name: Preserve evidence even if execution fails
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sx-v4lend-atomicity-evidence
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: warn
